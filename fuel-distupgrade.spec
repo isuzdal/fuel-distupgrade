@@ -1,5 +1,3 @@
-#%define    name fuel-distupgrade-utils
-#Name:      %{name}
 Name:      fuel-distupgrade
 Version:   1.0
 Release:   1%{?dist}~mos1
@@ -9,7 +7,6 @@ Group:     Development/System
 License:   Apache
 URL:       http://mirantis.com
 Source0:   %{name}-%{version}.tar.gz
-#BuildRoot: %{_tmppath}/%{name}-%{version}-buildroot
 
 Requires:  fuel-dockerctl
 Requires:  gawk
@@ -25,7 +22,6 @@ to current upstream version.
 Remember, this script upgrade only _minor_ version.
 
 %prep
-#%setup -q -n %{name}-%{version}
 %setup -q
 
 %install
@@ -52,5 +48,5 @@ Remember, this script upgrade only _minor_ version.
 
 
 %changelog
-* Mon Feb 15 2016 Ivan Suzdal <isuzdal@gmail.com> - 1.0-1~mos1
+* Mon Feb 26 2016 Ivan Suzdal <isuzdal@gmail.com> - 1.0-1~mos1
 - Initial version
