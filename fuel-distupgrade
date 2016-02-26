@@ -171,8 +171,12 @@ function do_finalize () {
 
 function do_status () {
     local _status=$(head -n1 "${STATEFILE}")
-    _status=${_status#*do_}
-    echo "Step: ${_status%%,*}; Status: ${_status##*,}"
+    if [ ${_status} ]; then
+        echo "Nothing is happening"
+    else
+        _status=${_status#*do_}
+        echo "Step: ${_status%%,*}; Status: ${_status##*,}"
+    fi
 }
 
 # Parse opts
