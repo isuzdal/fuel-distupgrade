@@ -1,0 +1,366 @@
+function warn () {
+    local msg=${1}
+    echo -e "\e[91m${msg}\e[0m"
+}
+
+function die () {
+    echo "$@" >&2
+    exit 1
+}
+
+function lock () {
+    exec 1001>"${LOCKFILE}"
+    flock -n 1001 || {
+        warn "Another program instance is running";
+        return 1;
+    }
+}
+
+function unlock () {
+    flock -u 1001
+    rm -f "${LOCKFILE}"
+}
+
+function checkurlaccess () {
+    local checkurl=${1}
+    if [[ "${checkurl}" =~ ^(http|ftp) ]]; then
+        curl -sI "${checkurl}" -o /dev/null || {
+            warn "${checkurl} isn't available";
+            warn "Please check network settings and repeate 'update' step";
+            return 1
+        }
+    else
+        return 0
+    fi
+}
+
+function fail_step () {
+    local ind=$[${#FUNCNAME[@]} - 2]
+    echo -n "${FUNCNAME[$ind]},failed" > "${STATEFILE}"
+    unlock
+    warn "${FUNCNAME[$ind]} step was failed"
+    return 1
+}
+
+function check_step () {
+    local prev_step=$(head -n1 "${STATEFILE}")
+    local curr_step=${FUNCNAME[1]}
+    case ${curr_step} in
+        do_prepare)
+            lock
+            if [[ -n "${prev_step}" ]]; then
+                warn "Please, use ${curr_step#*do_} ONLY (and once) as a first step"
+                return 1
+            fi
+            check_avail_space "${REDUCE_LV}"
+            echo -n "${curr_step},started" > "${STATEFILE}"
+        ;;
+        do_update)
+            lock
+            if [[ "${prev_step%%,*}" == "do_prepare" ]]; then
+                if [[ "${prev_step##*,}" == "success" ]]; then
+                    checkurlaccess "${CHECKURL}"
+                    echo -n "${curr_step},started" > "${STATEFILE}"
+                else
+                    warn "Previous step was failed"
+                    warn "Please, use 'rollback' command for return to initial state"
+                    return 1
+                fi
+            else
+                warn "Please, use ${curr_step#*do_} ONLY (and once) after prepare"
+                return 1
+            fi
+        ;;
+        do_commit)
+            lock
+            if [[ "${prev_step%%,*}" == "do_update" ]]; then
+                if [[ "${prev_step##*,}" == "success" ]]; then
+                    echo -n "${curr_step},started" > "${STATEFILE}"
+                else
+                    warn "Previous step was failed"
+                    warn "Please, use 'rollback' command for return to initial state"
+                    return 1
+                fi
+            else
+                echo "Please, use ${curr_step#*do_} ONLY (and once) after update"
+                return 1
+            fi
+        ;;
+        do_rollback)
+            lock
+            if [ "${prev_step%%,*}" == "do_commit" -a "${prev_step##*,}" == "success" ]; then
+                warn "You can't use rollback after successful commit"
+                return 1
+            fi
+            if [ "${prev_step%%,*}" == "${curr_step}" ]; then
+                warn "Please, use ${curr_step#*do_} ONLY (and once) after successfull prepare/update or failed commit"
+                return 1
+            fi
+            echo ${curr_step} > "${STATEFILE}"
+        ;;
+        do_finalize)
+            lock
+            if [ "${prev_step%%,*}" == "do_prepare" -a "${prev_step##*,}" == "started" ]; then
+                return 0
+            elif [ "${prev_step%%,*}" == "do_commit" -a "${prev_step##*,}" == "success" ]; then
+                return 0
+            else
+                warn "You can use finalize ONLY after successed commit or rollback"
+                return 1
+            fi
+        ;;
+        *)
+            return 1
+        ;;
+    esac
+}
+
+function finish_step () {
+    local step_name=${FUNCNAME[1]}
+    echo -n "${step_name},success" > "${STATEFILE}"
+    unlock
+}
+
+function is_lvm_snapshot () {
+    if [ -L /dev/${1} ]; then
+        if [[ "$(lvs --noheadings ${1} -o lv_attr)" =~ ^[[:space:]]+[sS] ]]; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        echo "${1} is not found"
+    fi
+}
+
+function remove_snapshot () {
+    local lv=${1}
+    if is_lvm_snapshot ${lv}; then
+        lvremove --force ${lv} || \
+            { echo "Can't remove ${lv}";
+            echo "Please try remove snapshot ${lv} manually";
+            echo "With 'lvremove ${lv}' command"; }
+    fi
+}
+
+function merge_snapshot () {
+    local lv=${1}
+    if is_lvm_snapshot ${lv}; then
+        lvconvert --merge ${lv} || \
+            { echo "Can't merge ${lv}";
+            echo "Please try merge logical volume ${lv} manually";
+            echo "With command 'lvconvert --merge ${lv}'"; }
+    fi
+}
+
+function check_vg_space () {
+    local vgname=${1##*/dev/}
+    local vgname=${vgname%%/*}
+    local vg_size=$(printf %.0f $(vgs -o vg_free ${vgname} --units g --nosuffix --noheadings))
+    if [[ ${vg_size} -ge ${SUFFICIENT_SPACE} ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function check_avail_space () {
+    if check_vg_space ${1}; then
+        return 0
+    elif [[ $(get_free_space ${1}) -ge ${SUFFICIENT_SPACE} ]]; then
+        return 0
+    else
+        warn "Not enough free space available"
+        return 1
+    fi
+}
+
+function get_fstype () {
+    local blkdev="/dev/${1##*/dev/}"
+    local fstype="$(blkid -o value -s TYPE ${blkdev})"
+    if [ -n ${fstype} ]; then
+        echo ${fstype}
+    else
+        echo "unknown"
+    fi
+}
+
+function get_free_space () {
+    local blkdev="/dev/${1##*/dev/}"
+    if [[ $(get_fstype ${blkdev}) =~ ^ext ]]; then
+        local block_size=$(tune2fs -l ${blkdev} | \
+            awk -F\: '$1 == "Block size" {print $2;}')
+        local free_blocks=$(tune2fs -l ${blkdev} | \
+            awk -F\: '$1 == "Free blocks" {print $2;}')
+
+        local free_bytes=$[${free_blocks}*${block_size}]
+        # Return free space minus ${RESERVED_SPACE} Gb
+        echo $[$[${free_bytes}/1024**3] - ${RESERVED_SPACE}]
+    else
+        warn "Unsupported file system on ${blkdev}"
+        return 1
+    fi
+}
+
+function stop_docker () {
+    stop_service supervisord
+    dockerctl stop all
+    stop_service docker
+}
+
+function start_docker () {
+    start_service docker
+    start_service supervisord
+}
+
+function disable_docker () {
+    chkconfig supervisord off
+    chkconfig docker off
+}
+
+function enable_docker () {
+    chkconfig docker on
+    chkconfig supervisord on
+}
+
+function umount_varlog() {
+    # Stop the services we know might be running
+    for srv in ${KNOWN_SERVICES}; do
+        stop_service ${srv}
+    done
+
+    # Stop other services
+    for pid in $(lsof -nt /var/log); do
+        comm=$(cat /proc/${pid}/comm)
+        stop_service ${comm}
+    done
+
+    # Terminate other processes
+    for pid in $(lsof -nt /var/log); do
+        kill $pid
+    done
+
+    # Kill the rest
+    for pid in $(lsof -nt /var/log); do
+        kill -9 $pid
+    done
+
+    umount /var/log
+}
+
+function start_service () {
+    local srv=${1}
+    if [ -x /usr/bin/systemctl ]; then
+        systemctl is-active ${srv} || \
+        systemctl start ${srv} || true
+    elif [ -f /etc/init.d/${srv} ]; then
+            service ${srv} start || true
+    fi
+}
+
+function stop_service () {
+    local srv=${1}
+    if [ -x /usr/bin/systemctl ]; then
+        systemctl is-active ${srv} && \
+            systemctl stop ${srv} || true
+    elif [ -f /etc/init.d/${srv} ]; then
+            service ${srv} stop || true
+    fi
+}
+
+function reduce_varlog () {
+    local size=${1}
+    local lv=${2:-os/varlog}
+
+    lvresize -L-${size} -r /dev/${lv}
+}
+
+function make_lv_snap () {
+    local lv=${1}
+    local size=${2}
+
+    lvcreate --size ${size} --snapshot --name ${lv#*/}-snap ${lv}
+}
+
+# Erase and install package back in one transaction
+# Can't use 'reinstall' because the package might be installed
+#   from different repository. 'reinstall' will install from
+#   the same repo.
+# Also I have to check that the package is really installed
+#   before trying to reinstall it.
+function replace_package () {
+    local old_name=${1}
+    local new_name=${2:-$1}
+
+    if [[ -z "${old_name}" ]]; then
+        return
+    fi
+
+    if rpm -q "${old_name}"; then
+        yumscript=$(mktemp)
+        echo "erase ${old_name}" > ${yumscript}
+        echo "install ${new_name}" >> ${yumscript}
+        echo "run" >> ${yumscript}
+        yum -y shell ${yumscript}
+    fi
+}
+
+
+function install_if_not_present () {
+    local pkg=${1}
+    rpm -q ${pkg} || yum install -y ${pkg}
+}
+
+
+function disable_repo () {
+    local repo=${1}
+    yum-config-manager --disable ${repo} > /dev/null
+}
+
+function enable_repo () {
+    local repo=${1}
+    yum-config-manager --enable ${repo} > /dev/null
+}
+
+function set_repo_option () {
+    local repo=${1}
+    local option=${2}
+    local value=${3}
+    yum-config-manager --save --setopt=${repo}.${option}=${value} > /dev/null
+}
+
+function sync_repo () {
+    local whitelist=${1}
+    local dstdir=${2}
+    local failed_log="/root/fuel-distupgrade.failed_sync_rpms"
+    local fromrepo=${3:-nailgun}
+
+    local failed_packages=""
+
+    if [[ -f "${whitelist}" ]]; then
+        local whitelist=$(readlink -f "${whitelist}")
+    else
+        die "Whitelist file '${whitelist}' not found"
+    fi
+
+    local dstdir=$(readlink -m ${dstdir})
+
+    mkdir -p ${dstdir}
+    for pkg in $(cat ${whitelist}); do
+        echo "Downloading '${pkg}' package"
+        yumdownloader --disablerepo=* --enablerepo=${fromrepo} \
+            --destdir "${dstdir}" "${pkg}" > /dev/null || failed_packages+=" ${pkg}"
+    done
+
+    pushd "${dstdir}"
+    createrepo -q .
+    popd
+
+
+    if [[ ${#failed_packages} -ne 0 ]]; then
+        for pkg in ${failed_packages}; do
+            echo ${pkg} >> "${failed_log}"
+        done
+        die "Failed packages: ${failed_packages}"
+    fi
+}

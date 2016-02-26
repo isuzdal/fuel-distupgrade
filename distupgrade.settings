@@ -1,0 +1,19 @@
+KNOWN_SERVICES="atop auditd monit rsyslog"
+
+VAR_SNAP_SIZE=10
+ROOT_SNAP_SIZE=5
+VARLIBDOCKER_SNAP_SIZE=5
+RESERVED_SPACE=5
+SUFFICIENT_SPACE=$[${ROOT_SNAP_SIZE} + ${VAR_SNAP_SIZE} + ${VARLIBDOCKER_SNAP_SIZE}]
+REDUCE_LV="os/varlog"
+
+CURRENT_RELEASE=$(
+  python -c "import yaml; print(yaml.load(open('/etc/fuel/version.yaml','r').read())['VERSION']['release'])"
+)
+
+NAILGUN_REPO_PATH=/var/www/nailgun/centos/x86_64
+MOS_BASE_REPO_PATH=/var/www/nailgun/centos/mos${CURRENT_RELEASE}-base
+WHITELIST=/usr/share/fuel-distupgrade/mos${CURRENT_RELEASE}-base.whitelist
+STATEFILE=/var/tmp/fuel-distupgrade.state
+LOCKFILE="/var/lock/fuel-distupgrade.lock"
+CHECKURL="http://mirrorlist.centos.org"

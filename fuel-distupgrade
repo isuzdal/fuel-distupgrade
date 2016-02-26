@@ -1,0 +1,197 @@
+#!/bin/bash
+
+exec > >(tee -a /root/fuel-distupgrade.log)
+exec 2>> /root/fuel-distupgrade.debug.log
+
+set -o nounset
+set -o errexit
+set -o xtrace
+
+source /etc/fuel/distupgrade.settings
+source /usr/share/fuel-distupgrade/functions
+
+trap fail_step ERR SIGINT SIGABRT SIGTERM
+
+function usage() {
+    echo "Usage: $(basename $0) command"
+    echo
+    echo "Available commands:"
+    echo "  prepare:  prepare node to upgrade"
+    echo "  update:   update os to current (minor) version"
+    echo "  commit:   commit all changes made by prepare/update actions"
+    echo "  rollback: rollback to pre-update state"
+    echo "  finalize: finalize update"
+    echo "  status:   show last/current step and status"
+    echo ""
+    echo "Update commands sequence:"
+    echo "  prepare -> update (+reboot) -> commit -> finalize"
+    echo "If something went wrong:"
+    echo "  rollback (+reboot) -> finalize"
+}
+
+function do_prepare () {
+    check_step
+    stop_docker
+    disable_docker
+
+    if ! check_vg_space ${REDUCE_LV}; then
+        umount_varlog
+        reduce_varlog ${SUFFICIENT_SPACE}G
+        mount /var/log
+    fi
+    make_lv_snap os/var ${VAR_SNAP_SIZE}G
+    make_lv_snap os/root ${ROOT_SNAP_SIZE}G
+    make_lv_snap os/varlibdocker ${VARLIBDOCKER_SNAP_SIZE}G
+
+    for srv in ${KNOWN_SERVICES}; do
+        start_service ${srv}
+    done
+    rsync -apl --delete /boot/ /boot.bak/
+    echo "Upgrade prepared"
+    finish_step
+}
+
+function do_update () {
+    check_step
+
+    # Create a copy of yum.repos.d for using it inside containers
+    cp -r /etc/yum.repos.d /etc/yum.repos.d.nailgun
+
+    # Install necessary packages
+    for pkg in yum-{plugin-priorities,utils}; do
+        install_if_not_present ${pkg}
+    done
+
+    # Prepare local base repository
+    if [ -f "${WHITELIST}" ]; then
+        sync_repo "${WHITELIST}" "${MOS_BASE_REPO_PATH}"
+    fi
+
+    # Disable nailgun repo
+    disable_repo nailgun
+
+    # Create base repo file
+    cat << EOF > /etc/yum.repos.d/mos${CURRENT_RELEASE}-base.repo
+[mos${CURRENT_RELEASE}-base]
+enabled=0
+name=MOS-${CURRENT_RELEASE} Local Repo
+baseurl=file://${MOS_BASE_REPO_PATH}
+gpgcheck=0
+EOF
+
+    # Disable mos-X repos
+    for repoid in mos${CURRENT_RELEASE}-{base,security,updates}; do
+        disable_repo ${repoid}
+    done
+
+    # Reinstall centos-release package
+    yum reinstall -y --disablerepo=* --enablerepo=nailgun centos-release
+
+    # Enable mos-X repositories back
+    for repoid in mos${CURRENT_RELEASE}-{base,security,updates}; do
+        enable_repo ${repoid}
+        set_repo_option ${repoid} priority 10
+    done
+
+    # Replace linux-firmware with kernel-firmware
+    replace_package linux-firmware kernel-firmware
+
+    start_docker
+
+    # Update yum cache and install updates
+    yum clean metadata
+    yum makecache
+    yum -y distro-sync
+
+    # Update dockerctl config file to mount old yum.repos.d inside containers
+    sed -i "/^HOST_VOL/ s|\ /etc/yum.repos.d:|\ /etc/yum.repos.d.nailgun:|" /etc/dockerctl/config
+
+    # All done
+    echo "Updated"
+    finish_step
+}
+
+
+function do_commit () {
+    check_step
+    local failed_snapshots=
+
+    start_docker
+    dockerctl destroy all
+    dockerctl start all
+    dockerctl check all &> /dev/null
+    enable_docker
+
+    for snapshot in os/{var,root,varlibdocker}-snap; do
+        remove_snapshot ${snapshot}
+    done
+
+    if [[ ${#failed_snapshots} -eq 0 ]]; then
+        echo "Snapshots were successfully removed."
+    else
+        echo "Some snapshots '${failed_snapshots}' weren't removed"
+    fi
+    finish_step
+}
+
+function do_rollback () {
+    check_step
+    rsync -apl --delete /boot.bak/ /boot/
+
+    install -m 0644 /root/fuel-distupgrade*.log /var/log/
+    for snapshot in os/{var,root,varlibdocker}-snap; do
+        merge_snapshot ${snapshot}
+    done
+
+    echo "Snapshots were merged."
+    echo "Please, reboot node for reverting to pre-upgrade state machine."
+}
+
+
+function do_finalize () {
+    check_step
+    lock
+    local prev_step=$(head -n1 "${STATEFILE}")
+    if [ "${prev_step%%,*}" == "do_prepare" ]; then
+        echo "Waiting for snapshot are merged"
+        while [[ "$(lvs --noheadings os/varlibdocker -o lv_attr)" =~ ^[[:space:]]+O ]]; do
+            echo -n '.'
+            sleep 1
+        done
+        echo ''
+        echo "Snapshots are merged"
+        enable_docker
+        start_docker
+    else
+        echo "Congratulations! All done"
+    fi
+    rm -f "${STATEFILE}"
+    unlock
+}
+
+function do_status () {
+    local _status=$(head -n1 "${STATEFILE}")
+    _status=${_status#*do_}
+    echo "Step: ${_status%%,*}; Status: ${_status##*,}"
+}
+
+# Parse opts
+if [ $# -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+# Touch statefile
+if [ ! -f "${STATEFILE}" ]; then
+    touch "${STATEFILE}"
+fi
+
+case "${1}" in
+    prepare)    do_prepare;;
+    update)     do_update;;
+    commit)     do_commit;;
+    rollback)   do_rollback;;
+    finalize)   do_finalize;;
+    status)     do_status;;
+    *) usage;;
+esac
