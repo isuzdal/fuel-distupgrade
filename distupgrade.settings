@@ -11,9 +11,21 @@ CURRENT_RELEASE=$(
   python -c "import yaml; print(yaml.load(open('/etc/fuel/version.yaml','r').read())['VERSION']['release'])"
 )
 
-NAILGUN_REPO_PATH=/var/www/nailgun/centos/x86_64
-MOS_BASE_REPO_PATH=/var/www/nailgun/centos/mos${CURRENT_RELEASE}-base
+NAILGUN_BASE_PATH=${NAILGUN_BASE_PATH:-/var/www/nailgun}
+NAILGUN_REPO_PATH=${NAILGUN_BASE_PATH}/centos/x86_64
+MOS_BASE_REPO_PATH=${NAILGUN_BASE_PATH}/centos/mos${CURRENT_RELEASE}-base
+
 WHITELIST=/usr/share/fuel-distupgrade/mos${CURRENT_RELEASE}-base.whitelist
 STATEFILE=/var/tmp/fuel-distupgrade.state
 LOCKFILE="/var/lock/fuel-distupgrade.lock"
+
 CHECKURL="http://mirrorlist.centos.org"
+
+if [ -z "${SECOND_PASS}" ]; then
+  if [ -e "/etc/fuel/mos${CURRENT_RELEASE}.settings" ]; then
+    source /etc/fuel/mos${CURRENT_RELEASE}.settings
+    SECOND_PASS='true'
+    source /etc/fuel/distupgrade.settings
+    return
+  fi
+fi
