@@ -189,9 +189,9 @@ function get_free_space () {
     local blkdev="/dev/${1##*/dev/}"
     if [[ $(get_fstype ${blkdev}) =~ ^ext ]]; then
         local block_size=$(tune2fs -l ${blkdev} | \
-            awk -F\: '$1 == "Block size" {print $2;}')
+            awk '/^Block size\:/{print $3; exit}')
         local free_blocks=$(tune2fs -l ${blkdev} | \
-            awk -F\: '$1 == "Free blocks" {print $2;}')
+            awk '/^Free blocks\:/{print $3; exit}')
 
         local free_bytes=$[${free_blocks}*${block_size}]
         # Return free space minus ${RESERVED_SPACE} Gb
