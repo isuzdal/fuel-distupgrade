@@ -21,6 +21,7 @@ LOCKFILE="/var/lock/fuel-distupgrade.lock"
 
 CHECKURL="http://mirrorlist.centos.org"
 
+SECOND_PASS=${SECOND_PASS:-}
 if [ -z "${SECOND_PASS}" ]; then
   if [ -e "/etc/fuel/mos${CURRENT_RELEASE}.settings" ]; then
     source /etc/fuel/mos${CURRENT_RELEASE}.settings
