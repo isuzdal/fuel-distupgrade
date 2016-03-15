@@ -202,25 +202,56 @@ function get_free_space () {
     fi
 }
 
+function set_systemd_timeout () {
+    cp /etc/systemd/system.conf{,.fuel}
+    if grep -q ^DefaultTimeoutStartSec= /etc/systemd/system.conf; then
+        sed -i 's|DefaultTimeoutStartSec=.*|DefaultTimeoutStartSec=300s|g' /etc/systemd/system.conf
+    else
+        echo 'DefaultTimeoutStartSec=300s' >> /etc/systemd/system.conf
+    fi
+    systemctl daemon-reexec
+}
+
+function restore_systemd_config () {
+    mv /etc/systemd/system.conf{.fuel,}
+    systemctl daemon-reexec
+}
+
+function get_containers () {
+    local containers=
+    for srv in /usr/lib/systemd/system/docker-*.service; do
+        if [[ "${srv##*/}" != "docker-storage-setup.service" ]]; then
+            containers+="${srv##*/} "
+        fi
+    done
+    echo ${containers}
+}
+
 function stop_docker () {
-    stop_service supervisord
-    dockerctl stop all
+    stop_containers
     stop_service docker
 }
 
 function start_docker () {
     start_service docker
-    start_service supervisord
 }
 
 function disable_docker () {
-    chkconfig supervisord off
-    chkconfig docker off
+    systemctl -q disable $(get_containers)
+    systemctl -q disable docker
 }
 
 function enable_docker () {
-    chkconfig docker on
-    chkconfig supervisord on
+    systemctl -q enable docker
+    systemctl -q enable $(get_containers)
+}
+
+function stop_containers () {
+    systemctl stop $(get_containers)
+}
+
+function start_containers () {
+    systemctl start $(get_containers)
 }
 
 function umount_varlog() {
@@ -237,12 +268,12 @@ function umount_varlog() {
 
     # Terminate other processes
     for pid in $(lsof -nt /var/log); do
-        kill $pid
+        [ -L /proc/${pid}/exe ] && kill ${pid}
     done
 
     # Kill the rest
     for pid in $(lsof -nt /var/log); do
-        kill -9 $pid
+        [ -L /proc/${pid}/exe ] && kill -9 ${pid}
     done
 
     umount /var/log
@@ -251,7 +282,7 @@ function umount_varlog() {
 function start_service () {
     local srv=${1}
     if [ -x /usr/bin/systemctl ]; then
-        systemctl is-active ${srv} || \
+        systemctl -q is-active ${srv} || \
         systemctl start ${srv} || true
     elif [ -f /etc/init.d/${srv} ]; then
             service ${srv} start || true
@@ -261,7 +292,7 @@ function start_service () {
 function stop_service () {
     local srv=${1}
     if [ -x /usr/bin/systemctl ]; then
-        systemctl is-active ${srv} && \
+        systemctl -q is-active ${srv} && \
             systemctl stop ${srv} || true
     elif [ -f /etc/init.d/${srv} ]; then
             service ${srv} stop || true

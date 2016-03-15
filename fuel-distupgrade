@@ -31,6 +31,7 @@ function usage() {
 
 function do_prepare () {
     check_step
+    set_systemd_timeout
     stop_docker
     disable_docker
 
@@ -41,7 +42,6 @@ function do_prepare () {
     fi
     make_lv_snap os/var ${VAR_SNAP_SIZE}G
     make_lv_snap os/root ${ROOT_SNAP_SIZE}G
-    make_lv_snap os/varlibdocker ${VARLIBDOCKER_SNAP_SIZE}G
 
     for srv in ${KNOWN_SERVICES}; do
         start_service ${srv}
@@ -54,9 +54,6 @@ function do_prepare () {
 function do_update () {
     check_step
 
-    # Create a copy of yum.repos.d for using it inside containers
-    cp -r /etc/yum.repos.d /etc/yum.repos.d.nailgun
-
     # Install necessary packages
     for pkg in yum-{plugin-priorities,utils}; do
         install_if_not_present ${pkg}
@@ -64,7 +61,7 @@ function do_update () {
 
     # Prepare local base repository
     if [ -f "${WHITELIST}" ]; then
-        sync_repo "${WHITELIST}" "${MOS_BASE_REPO_PATH}"
+        sync_repo "${WHITELIST}" "${MOS_BASE_REPO_PATH}" mos
     fi
 
     # Disable nailgun repo
@@ -93,18 +90,12 @@ EOF
         set_repo_option ${repoid} priority 10
     done
 
-    # Replace linux-firmware with kernel-firmware
-    replace_package linux-firmware kernel-firmware
-
     start_docker
 
     # Update yum cache and install updates
     yum clean metadata
     yum makecache
     yum -y distro-sync
-
-    # Update dockerctl config file to mount old yum.repos.d inside containers
-    sed -i "/^HOST_VOL/ s|\ /etc/yum.repos.d:|\ /etc/yum.repos.d.nailgun:|" /etc/dockerctl/config
 
     # All done
     echo "Updated"
@@ -117,12 +108,12 @@ function do_commit () {
     local failed_snapshots=
 
     start_docker
-    dockerctl destroy all
-    dockerctl start all
+    #dockerctl destroy all
+    start_containers
     dockerctl check all &> /dev/null
     enable_docker
 
-    for snapshot in os/{var,root,varlibdocker}-snap; do
+    for snapshot in os/{var,root}-snap; do
         remove_snapshot ${snapshot}
     done
 
@@ -139,7 +130,7 @@ function do_rollback () {
     rsync -apl --delete /boot.bak/ /boot/
 
     install -m 0644 /root/fuel-distupgrade*.log /var/log/
-    for snapshot in os/{var,root,varlibdocker}-snap; do
+    for snapshot in os/{var,root}-snap; do
         merge_snapshot ${snapshot}
     done
 
@@ -154,7 +145,7 @@ function do_finalize () {
     local prev_step=$(head -n1 "${STATEFILE}")
     if [ "${prev_step%%,*}" == "do_prepare" ]; then
         echo "Waiting for snapshot are merged"
-        while [[ "$(lvs --noheadings os/varlibdocker -o lv_attr)" =~ ^[[:space:]]+O ]]; do
+        while [[ "$(lvs --noheadings os/var -o lv_attr)" =~ ^[[:space:]]+O ]]; do
             echo -n '.'
             sleep 1
         done
@@ -162,9 +153,10 @@ function do_finalize () {
         echo "Snapshots are merged"
         enable_docker
         start_docker
-    else
-        echo "Congratulations! All done"
+        start_containers
     fi
+    restore_systemd_config
+    echo "Congratulations! All done"
     rm -f "${STATEFILE}"
     unlock
 }
