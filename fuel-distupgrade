@@ -103,8 +103,8 @@ EOF
     yum makecache
     yum -y distro-sync
 
-    # Update dockerctl config file to mount old yum.repos.d inside containers
-    sed -i "/^HOST_VOL/ s|\ /etc/yum.repos.d:|\ /etc/yum.repos.d.nailgun:|" /etc/dockerctl/config
+    ## Update dockerctl config file to mount old yum.repos.d inside containers
+    #sed -i "/^HOST_VOL/ s|\ /etc/yum.repos.d:|\ /etc/yum.repos.d.nailgun:|" /etc/dockerctl/config
 
     # All done
     echo "Updated"
@@ -116,8 +116,11 @@ function do_commit () {
     check_step
     local failed_snapshots=
 
+    for repo in base extras updates; do
+        disable_repo ${repo}
+    done
+
     start_docker
-    dockerctl destroy all
     dockerctl start all
     dockerctl check all &> /dev/null
     enable_docker
@@ -162,9 +165,8 @@ function do_finalize () {
         echo "Snapshots are merged"
         enable_docker
         start_docker
-    else
-        echo "Congratulations! All done"
     fi
+    echo "Congratulations! All done"
     rm -f "${STATEFILE}"
     unlock
 }
